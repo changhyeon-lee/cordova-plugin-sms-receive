@@ -3,6 +3,7 @@ package com.andreszs.cordova.sms;
 import android.Manifest;
 import android.app.Activity;
 import android.content.BroadcastReceiver;
+import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
@@ -14,9 +15,16 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.telephony.SmsMessage;
 import android.provider.Telephony;
+import android.text.TextUtils;
 import android.util.Log;
 
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.security.MessageDigest;
+import java.text.MessageFormat;
+import java.util.Date;
 
 import org.apache.cordova.CallbackContext;
 import org.apache.cordova.CordovaPlugin;
@@ -31,11 +39,14 @@ public class SMSReceive extends CordovaPlugin {
 	private static final String ACTION_START_WATCH = "startWatch";
 	private static final String ACTION_STOP_WATCH = "stopWatch";
 	private static final String SMS_RECEIVED_ACTION = "android.provider.Telephony.SMS_RECEIVED";
+	private static final String MMS_RECEIVED_ACTION = "android.provider.Telephony.WAP_PUSH_RECEIVED";
+	private static final String MMS_DATA_TYPE = "application/vnd.wap.mms-message";
 
 	public static final int START_WATCH_REQ_CODE = 0;
 	public static final int PERMISSION_DENIED_ERROR = 20;
 
-	private BroadcastReceiver mReceiver = null;
+	private BroadcastReceiver smsReceiver = null;
+	private BroadcastReceiver mmsReceiver = null;
 
 	private JSONArray requestArgs;
 	private CallbackContext callbackContext;
@@ -68,8 +79,11 @@ public class SMSReceive extends CordovaPlugin {
 
 	private PluginResult startWatch(CallbackContext callbackContext) {
 		Log.d(LOG_TAG, ACTION_START_WATCH);
-		if (this.mReceiver == null) {
+		if (this.smsReceiver == null) {
 			this.createIncomingSMSReceiver();
+		}
+		if (this.mmsReceiver == null) {
+			this.createIncomingMMSReceiver();
 		}
 		if (callbackContext != null) {
 			callbackContext.success();
@@ -79,13 +93,22 @@ public class SMSReceive extends CordovaPlugin {
 
 	private PluginResult stopWatch(CallbackContext callbackContext) {
 		Log.d(LOG_TAG, ACTION_STOP_WATCH);
-		if (this.mReceiver != null) {
+		if (this.smsReceiver != null) {
 			try {
-				webView.getContext().unregisterReceiver(this.mReceiver);
+				webView.getContext().unregisterReceiver(this.smsReceiver);
 			} catch (Exception e) {
 				Log.d(LOG_TAG, "error unregistering network receiver: " + e.getMessage());
 			} finally {
-				this.mReceiver = null;
+				this.smsReceiver = null;
+			}
+		}
+		if (this.mmsReceiver != null) {
+			try {
+				webView.getContext().unregisterReceiver(this.mmsReceiver);
+			} catch (Exception e) {
+				Log.d(LOG_TAG, "error unregistering network receiver: " + e.getMessage());
+			} finally {
+				this.mmsReceiver = null;
 			}
 		}
 		if (callbackContext != null) {
@@ -103,19 +126,19 @@ public class SMSReceive extends CordovaPlugin {
 				switch(cur.getType(j)) {
 					case Cursor.FIELD_TYPE_NULL:
 						json.put(keys[j], JSONObject.NULL);
-					break;
+						break;
 					case Cursor.FIELD_TYPE_INTEGER:
 						json.put(keys[j], cur.getLong(j));
-					break;
+						break;
 					case Cursor.FIELD_TYPE_FLOAT:
 						json.put(keys[j], cur.getFloat(j));
-					break;
+						break;
 					case Cursor.FIELD_TYPE_STRING:
 						json.put(keys[j], cur.getString(j));
-					break;
+						break;
 					case Cursor.FIELD_TYPE_BLOB:
 						json.put(keys[j], cur.getBlob(j));
-					break;
+						break;
 				}
 			}
 		}
@@ -130,7 +153,7 @@ public class SMSReceive extends CordovaPlugin {
 	}
 
 	protected void createIncomingSMSReceiver() {
-		this.mReceiver = new BroadcastReceiver() {
+		this.smsReceiver = new BroadcastReceiver() {
 			public void onReceive(Context context, Intent intent) {
 				if (intent.getAction().equals(SMS_RECEIVED_ACTION)) {
 					// Create SMS container
@@ -165,7 +188,28 @@ public class SMSReceive extends CordovaPlugin {
 		};
 		IntentFilter filter = new IntentFilter(SMS_RECEIVED_ACTION);
 		try {
-			webView.getContext().registerReceiver(this.mReceiver, filter);
+			webView.getContext().registerReceiver(this.smsReceiver, filter);
+		} catch (Exception e) {
+			Log.d(LOG_TAG, "error registering broadcast receiver: " + e.getMessage());
+		}
+	}
+
+	protected void createIncomingMMSReceiver() {
+		this.mmsReceiver = new BroadcastReceiver() {
+			public void onReceive(Context context, Intent intent) {
+
+				if (intent.getAction().equals(MMS_RECEIVED_ACTION)) {
+					JSONObject jsms = getJsonFromMmsMessage();
+					SMSReceive.this.onSMSArrive(jsms);
+					Log.d(LOG_TAG, jsms.toString());
+				}
+			}
+		};
+		IntentFilter filter = new IntentFilter();
+		try {
+			filter.addAction(MMS_RECEIVED_ACTION);
+			filter.addDataType(MMS_DATA_TYPE);
+			webView.getContext().registerReceiver(this.mmsReceiver, filter);
 		} catch (Exception e) {
 			Log.d(LOG_TAG, "error registering broadcast receiver: " + e.getMessage());
 		}
@@ -186,6 +230,127 @@ public class SMSReceive extends CordovaPlugin {
 		return json;
 	}
 
+	private JSONObject getJsonFromMmsMessage() {
+		JSONObject json = new JSONObject();
+		try {
+			// 수신된 MMS 중 가장 최근 메시지의 id를 가져온다.
+			ContentResolver contentResolver = this.cordova.getContext().getContentResolver();
+			final String[] projection = new String[]{"_id"};
+			Uri uri = Uri.parse("content://mms");
+			Cursor cursor = contentResolver.query(uri, projection, null, null, "_id desc limit 1");
+
+			// 데이터가 존재하지 않는 경우
+			if (cursor.getCount() == 0) {
+				cursor.close();
+				return null;
+			}
+
+			// 제일 처음 레코드로 이동하여 아이디를 가져온다.
+			cursor.moveToFirst();
+			String id = cursor.getString(cursor.getColumnIndex("_id"));
+			cursor.close();
+
+			String number = getAddressNumberFromMMS(id);
+			String msg = getMessageFromMMS(id);
+
+			json.put( "address", number );
+			json.put( "body", msg ); // May need sms.getMessageBody.toString()
+			json.put( "date_sent", System.currentTimeMillis() );
+			json.put( "date", System.currentTimeMillis() );
+			json.put( "service_center", "");
+		}
+		catch (Exception e) {
+			Log.d(LOG_TAG, e.getMessage());
+		}
+		return json;
+	}
+
+	private String getAddressNumberFromMMS(String id) {
+		String selection = new String("msg_id=" + id);
+		String uriStr = MessageFormat.format("content://mms/{0}/addr", id);
+		Uri uriAddress = Uri.parse(uriStr);
+
+		ContentResolver contentResolver = this.cordova.getContext().getContentResolver();
+		Cursor cAdd = contentResolver.query(uriAddress, new String[] { "address" }, selection, null, null);
+		String name = null;
+		if (cAdd.moveToFirst()) {
+			do {
+				String number = cAdd.getString(cAdd.getColumnIndex("address"));
+				if (number != null) {
+					try {
+						Long.parseLong(number.replace("-", ""));
+						name = number;
+					} catch (NumberFormatException nfe) {
+						if (name == null) {
+							name = number;
+						}
+					}
+				}
+			} while (cAdd.moveToNext());
+		}
+		if (cAdd != null) {
+			cAdd.close();
+		}
+		return name;
+	}
+
+	private String getMessageFromMMS(String id)
+	{
+		String result = "";
+
+		String selectionPart = "mid=" + id;
+		Uri uri = Uri.parse("content://mms/part");
+		ContentResolver contentResolver = this.cordova.getContext().getContentResolver();
+		Cursor cursor = contentResolver.query(uri, null, selectionPart, null, null);
+		if (cursor.moveToFirst()) {
+			do {
+				String partId = cursor.getString(cursor.getColumnIndex("_id"));
+				String type = cursor.getString(cursor.getColumnIndex("ct"));
+				if ("text/plain".equals(type)) {
+					String data = cursor.getString(cursor.getColumnIndex("_data"));
+					String body;
+					if (data != null) {
+						result = parseMessageWithPartId(partId);
+					} else {
+						result = cursor.getString(cursor.getColumnIndex("text"));
+					}
+
+					break;
+				}
+			} while (cursor.moveToNext());
+		}
+
+		return result;
+	}
+
+	private String parseMessageWithPartId(String id)
+	{
+		Uri partURI = Uri.parse("content://mms/part/" + id);
+		InputStream is = null;
+		StringBuilder sb = new StringBuilder();
+		try {
+			ContentResolver contentResolver = this.cordova.getContext().getContentResolver();
+			is = contentResolver.openInputStream(partURI);
+			if (is != null) {
+				InputStreamReader isr = new InputStreamReader(is, "UTF-8");
+				BufferedReader reader = new BufferedReader(isr);
+				String temp = reader.readLine();
+				while (temp != null) {
+					sb.append(temp);
+					temp = reader.readLine();
+				}
+			}
+		} catch (IOException e) {}
+		finally {
+			if (is != null) {
+				try {
+					is.close();
+				} catch (IOException e) {}
+			}
+		}
+		return sb.toString();
+	}
+
 	/**
 	 * Check if we have been granted SMS receiving permission on Android 6+
 	 */
@@ -196,6 +361,10 @@ public class SMSReceive extends CordovaPlugin {
 		}
 
 		if (cordova.getActivity().checkSelfPermission(Manifest.permission.RECEIVE_SMS) == PackageManager.PERMISSION_DENIED) {
+			return false;
+		}
+
+		if (cordova.getActivity().checkSelfPermission(Manifest.permission.RECEIVE_MMS) == PackageManager.PERMISSION_DENIED) {
 			return false;
 		}
 
@@ -214,7 +383,7 @@ public class SMSReceive extends CordovaPlugin {
 		cordova.requestPermission(this, requestCode, Manifest.permission.RECEIVE_SMS);
 
 	}
-	
+
 	/**
 	 * processes the result of permission request
 	 *
@@ -235,7 +404,7 @@ public class SMSReceive extends CordovaPlugin {
 		switch(requestCode) {
 			case START_WATCH_REQ_CODE:
 				this.startWatch(this.callbackContext);
-			break;
+				break;
 		}
 	}
 
