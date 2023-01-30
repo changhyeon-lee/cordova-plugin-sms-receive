@@ -1,5 +1,4 @@
-# ignore any IDE or OS-generated data
-node_modules/
+﻿#If ignorance is bliss, then somebody knock the smile off my face
 
 *.csproj.user
 *.suo
@@ -12,4 +11,6 @@ Thumbs.db
 *.log
 *.swp
 *.user
-/cordova-plugin-sms-receive.iml
+
+.idea
+node_modules
